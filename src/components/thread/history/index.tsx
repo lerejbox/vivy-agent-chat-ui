@@ -77,7 +77,6 @@ function ThreadHistoryLoading() {
 
 export default function ThreadHistory() {
   const isLargeScreen = useMediaQuery("(min-width: 1024px)");
-  const [threadId] = useQueryState("threadId");
   const [chatHistoryOpen, setChatHistoryOpen] = useQueryState(
     "chatHistoryOpen",
     parseAsBoolean.withDefault(false),
@@ -93,13 +92,7 @@ export default function ThreadHistory() {
       .then(setThreads)
       .catch(console.error)
       .finally(() => setThreadsLoading(false));
-  }, [
-    getThreads,
-    setThreads,
-    setThreadsLoading,
-    threadId,
-    chatHistoryOpen,
-  ]);
+  }, [getThreads, setThreads, setThreadsLoading]);
 
   return (
     <>
