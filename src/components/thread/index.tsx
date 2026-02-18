@@ -17,6 +17,8 @@ import { TooltipIconButton } from "./tooltip-icon-button";
 import {
   ArrowDown,
   LoaderCircle,
+  Mic,
+  MicOff,
   PanelRightOpen,
   PanelRightClose,
   SquarePen,
@@ -45,6 +47,7 @@ import {
   ArtifactTitle,
   useArtifactContext,
 } from "./artifact";
+
 
 function StickyToBottomContent(props: {
   content: ReactNode;
@@ -115,6 +118,7 @@ export function Thread() {
   const [artifactContext, setArtifactContext] = useArtifactContext();
   const [artifactOpen, closeArtifact] = useArtifactOpen();
 
+  const [apiUrl] = useQueryState("apiUrl");
   const [threadId, _setThreadId] = useQueryState("threadId");
   const [chatHistoryOpen, setChatHistoryOpen] = useQueryState(
     "chatHistoryOpen",
@@ -125,6 +129,9 @@ export function Thread() {
     parseAsBoolean.withDefault(false),
   );
   const [input, setInput] = useState("");
+  // micEnabled reflects the server-side speech loop state.
+  const [micEnabled, setMicEnabled] = useState(false);
+  const [isMicToggling, setIsMicToggling] = useState(false);
   const {
     contentBlocks,
     setContentBlocks,
@@ -139,8 +146,19 @@ export function Thread() {
   const isLargeScreen = useMediaQuery("(min-width: 1024px)");
 
   const stream = useStreamContext();
-  const messages = stream.messages;
+  const streamMessages = stream.messages;
   const isLoading = stream.isLoading;
+  const transcriptionApiUrl =
+    apiUrl || process.env.NEXT_PUBLIC_API_URL || "http://localhost:2024";
+  const [syncedMessages, setSyncedMessages] = useState<Message[] | null>(null);
+  const latestCheckpointIdRef = useRef<string | null>(null);
+
+  const messages =
+    isLoading
+      ? streamMessages
+      : syncedMessages && syncedMessages.length >= streamMessages.length
+        ? syncedMessages
+        : streamMessages;
 
   const lastError = useRef<string | undefined>(undefined);
 
@@ -151,6 +169,125 @@ export function Thread() {
     closeArtifact();
     setArtifactContext({});
   };
+
+  // Fetch the initial server-side speech loop status on mount.
+  useEffect(() => {
+    let disposed = false;
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch(`${transcriptionApiUrl}/speech/status`);
+        if (!res.ok || disposed) return;
+        const data = await res.json() as { running: boolean };
+        if (!disposed) setMicEnabled(data.running);
+      } catch {
+        // backend not yet up — default stays false
+      }
+    };
+    void fetchStatus();
+    return () => { disposed = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    setSyncedMessages(null);
+    latestCheckpointIdRef.current = null;
+  }, [threadId]);
+
+  useEffect(() => {
+    if (!threadId) {
+      return;
+    }
+
+    let disposed = false;
+    let reconnectTimerId: number | null = null;
+    let eventSource: EventSource | null = null;
+
+    const fetchThreadState = async () => {
+      try {
+        const stateResponse = await fetch(
+          `${transcriptionApiUrl}/threads/${encodeURIComponent(threadId)}/state`,
+        );
+        if (!stateResponse.ok || disposed) {
+          return;
+        }
+
+        const stateData = await stateResponse.json() as {
+          checkpoint?: { checkpoint_id?: string };
+          values?: { messages?: Message[] };
+        };
+        if (disposed) {
+          return;
+        }
+
+        const nextCheckpointId = stateData.checkpoint?.checkpoint_id;
+        const backendMessages = Array.isArray(stateData.values?.messages)
+          ? stateData.values?.messages
+          : [];
+
+        if (
+          typeof nextCheckpointId === "string" &&
+          nextCheckpointId.length > 0 &&
+          nextCheckpointId !== latestCheckpointIdRef.current
+        ) {
+          latestCheckpointIdRef.current = nextCheckpointId;
+          setSyncedMessages(backendMessages);
+        }
+      } catch {
+        // no-op
+      }
+    };
+
+    const connectEventStream = () => {
+      if (disposed) {
+        return;
+      }
+
+      eventSource = new EventSource(
+        `${transcriptionApiUrl}/threads/${encodeURIComponent(threadId)}/events`,
+      );
+
+      const handleCheckpoint = (event: MessageEvent<string>) => {
+        try {
+          const payload = JSON.parse(event.data) as { checkpoint_id?: string };
+          const checkpointId = payload.checkpoint_id;
+          if (
+            typeof checkpointId !== "string" ||
+            checkpointId.length === 0 ||
+            checkpointId === latestCheckpointIdRef.current
+          ) {
+            return;
+          }
+          void fetchThreadState();
+        } catch {
+          // no-op
+        }
+      };
+
+      eventSource.addEventListener("checkpoint", handleCheckpoint as EventListener);
+      eventSource.onerror = () => {
+        eventSource?.close();
+        eventSource = null;
+        if (!disposed) {
+          reconnectTimerId = window.setTimeout(connectEventStream, 1500);
+        }
+      };
+    };
+
+    void fetchThreadState();
+    connectEventStream();
+
+    return () => {
+      disposed = true;
+      if (eventSource) {
+        eventSource.close();
+      }
+      if (reconnectTimerId !== null) {
+        window.clearTimeout(reconnectTimerId);
+      }
+    };
+  }, [threadId, transcriptionApiUrl]);
+
+
 
   useEffect(() => {
     if (!stream.error) {
@@ -194,17 +331,19 @@ export function Thread() {
     prevMessageLength.current = messages.length;
   }, [messages]);
 
-  const handleSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    if ((input.trim().length === 0 && contentBlocks.length === 0) || isLoading)
+  const submitMessage = ({ textOverride }: { textOverride?: string } = {}) => {
+    const textValue = (textOverride ?? input).trim();
+    if ((textValue.length === 0 && contentBlocks.length === 0) || isLoading) {
       return;
+    }
+
     setFirstTokenReceived(false);
 
     const newHumanMessage: Message = {
       id: uuidv4(),
       type: "human",
       content: [
-        ...(input.trim().length > 0 ? [{ type: "text", text: input }] : []),
+        ...(textValue.length > 0 ? [{ type: "text", text: textValue }] : []),
         ...contentBlocks,
       ] as Message["content"],
     };
@@ -234,6 +373,38 @@ export function Thread() {
 
     setInput("");
     setContentBlocks([]);
+  };
+
+  const handleSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    submitMessage();
+  };
+
+  const handleMicToggle = async () => {
+    setIsMicToggling(true);
+    try {
+      const endpoint = micEnabled ? "/speech/stop" : "/speech/start";
+      const res = await fetch(`${transcriptionApiUrl}${endpoint}`, { method: "POST" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({})) as { detail?: string };
+        toast.error("Microphone toggle failed", {
+          description: body.detail ?? `HTTP ${res.status}`,
+          richColors: true,
+          closeButton: true,
+        });
+        return;
+      }
+      const data = await res.json() as { running: boolean };
+      setMicEnabled(data.running);
+    } catch (err) {
+      toast.error("Microphone toggle failed", {
+        description: err instanceof Error ? err.message : "Network error",
+        richColors: true,
+        closeButton: true,
+      });
+    } finally {
+      setIsMicToggling(false);
+    }
   };
 
   const handleRegenerate = (
@@ -516,6 +687,35 @@ export function Thread() {
                           accept="image/jpeg,image/png,image/gif,image/webp,application/pdf"
                           className="hidden"
                         />
+                        <TooltipIconButton
+                          type="button"
+                          className={cn(
+                            "size-8 p-1",
+                            micEnabled ? "text-primary" : "text-gray-600",
+                          )}
+                          tooltip={
+                            isMicToggling
+                              ? "Updating mic…"
+                              : micEnabled
+                                ? "Turn microphone off"
+                                : "Turn microphone on"
+                          }
+                          onClick={() => {
+                            void handleMicToggle();
+                          }}
+                          disabled={isMicToggling}
+                        >
+                          {micEnabled ? (
+                            <Mic
+                              className={cn(
+                                "size-5",
+                                micEnabled && "animate-pulse",
+                              )}
+                            />
+                          ) : (
+                            <MicOff className="size-5" />
+                          )}
+                        </TooltipIconButton>
                         {stream.isLoading ? (
                           <Button
                             key="stop"
