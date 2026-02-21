@@ -47,6 +47,7 @@ export async function transcribeAudioBlob(
 
 export interface BackendSpeechConfig {
     stt_provider: string;
+    mic_toggle_hotkey?: string;
     faster_whisper?: {
         chunk_sec?: number;
         min_recording_sec?: number;

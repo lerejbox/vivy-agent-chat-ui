@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useStreamContext } from "@/providers/Stream";
 import { useThreads } from "@/providers/Thread";
-import { useState, FormEvent } from "react";
+import { useState, FormEvent, useCallback } from "react";
 import { Button } from "../ui/button";
 import { Checkpoint, Message } from "@langchain/langgraph-sdk";
 import { AssistantMessage, AssistantMessageLoading } from "./messages/ai";
@@ -184,7 +184,7 @@ export function Thread() {
     }
   };
 
-  // Fetch the initial server-side speech loop status on mount.
+  // Fetch initial speech loop status.
   useEffect(() => {
     let disposed = false;
     const fetchStatus = async () => {
@@ -197,10 +197,51 @@ export function Thread() {
         // backend not yet up — default stays false
       }
     };
+
     void fetchStatus();
     return () => { disposed = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [transcriptionApiUrl]);
+
+  // Subscribe to backend-pushed mic status changes.
+  useEffect(() => {
+    let disposed = false;
+    let eventSource: EventSource | null = null;
+    let reconnectTimerId: number | null = null;
+
+    const connect = () => {
+      if (disposed) return;
+
+      eventSource = new EventSource(`${transcriptionApiUrl}/speech/status/events`);
+      eventSource.addEventListener("speech_status", ((event: MessageEvent<string>) => {
+        try {
+          const payload = JSON.parse(event.data) as { running?: boolean };
+          if (!disposed && typeof payload.running === "boolean") {
+            setMicEnabled(payload.running);
+          }
+        } catch {
+          // no-op
+        }
+      }) as EventListener);
+
+      eventSource.onerror = () => {
+        eventSource?.close();
+        eventSource = null;
+        if (!disposed) {
+          reconnectTimerId = window.setTimeout(connect, 1500);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+      eventSource?.close();
+      if (reconnectTimerId !== null) {
+        window.clearTimeout(reconnectTimerId);
+      }
+    };
+  }, [transcriptionApiUrl]);
 
   useEffect(() => {
     const abortController = new AbortController();
@@ -499,7 +540,11 @@ export function Thread() {
     submitMessage();
   };
 
-  const handleMicToggle = async () => {
+  const handleMicToggle = useCallback(async () => {
+    if (isMicToggling) {
+      return;
+    }
+
     setIsMicToggling(true);
     try {
       const endpoint = micEnabled ? "/speech/stop" : "/speech/start";
@@ -524,7 +569,7 @@ export function Thread() {
     } finally {
       setIsMicToggling(false);
     }
-  };
+  }, [isMicToggling, micEnabled, transcriptionApiUrl]);
 
   const handleRegenerate = (
     parentCheckpoint: Checkpoint | null | undefined,
