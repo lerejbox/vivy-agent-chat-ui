@@ -81,7 +81,7 @@ function Interrupt({
   const fallbackValue = Array.isArray(interrupt)
     ? (interrupt as Record<string, any>[])
     : (((interrupt as { value?: unknown } | undefined)?.value ??
-        interrupt) as Record<string, any>);
+      interrupt) as Record<string, any>);
 
   return (
     <>
@@ -90,8 +90,8 @@ function Interrupt({
           <ThreadView interrupt={interrupt} />
         )}
       {interrupt &&
-      !isAgentInboxInterruptSchema(interrupt) &&
-      (isLastMessage || hasNoAIOrToolMessages) ? (
+        !isAgentInboxInterruptSchema(interrupt) &&
+        (isLastMessage || hasNoAIOrToolMessages) ? (
         <GenericInterruptView interrupt={fallbackValue} />
       ) : null}
     </>
@@ -115,9 +115,10 @@ export function AssistantMessage({
   );
 
   const thread = useStreamContext();
-  const isLastMessage =
-    thread.messages[thread.messages.length - 1].id === message?.id;
-  const hasNoAIOrToolMessages = !thread.messages.find(
+  const messages = Array.isArray(thread.messages) ? thread.messages : [];
+  const lastMessage = messages[messages.length - 1];
+  const isLastMessage = lastMessage?.id === message?.id;
+  const hasNoAIOrToolMessages = !messages.find(
     (m) => m.type === "ai" || m.type === "tool",
   );
   const meta = message ? thread.getMessagesMetadata(message) : undefined;

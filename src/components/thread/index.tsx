@@ -3,6 +3,7 @@ import { ReactNode, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useStreamContext } from "@/providers/Stream";
+import { useThreads } from "@/providers/Thread";
 import { useState, FormEvent } from "react";
 import { Button } from "../ui/button";
 import { Checkpoint, Message } from "@langchain/langgraph-sdk";
@@ -47,6 +48,8 @@ import {
   ArtifactTitle,
   useArtifactContext,
 } from "./artifact";
+
+const SPEECH_IDLE_NEW_THREAD_MS = 2 * 60 * 1000;
 
 
 function StickyToBottomContent(props: {
@@ -146,12 +149,14 @@ export function Thread() {
   const isLargeScreen = useMediaQuery("(min-width: 1024px)");
 
   const stream = useStreamContext();
+  const { getThreads, setThreads } = useThreads();
   const streamMessages = stream.messages;
   const isLoading = stream.isLoading;
   const transcriptionApiUrl =
     apiUrl || process.env.NEXT_PUBLIC_API_URL || "http://localhost:2024";
   const [syncedMessages, setSyncedMessages] = useState<Message[] | null>(null);
   const latestCheckpointIdRef = useRef<string | null>(null);
+  const lastThreadActivityAtMsRef = useRef<number>(Date.now());
 
   const messages =
     isLoading
@@ -168,6 +173,15 @@ export function Thread() {
     // close artifact and reset artifact context
     closeArtifact();
     setArtifactContext({});
+  };
+
+  const refreshThreadHistory = async () => {
+    try {
+      const nextThreads = await getThreads();
+      setThreads(nextThreads);
+    } catch {
+      // no-op
+    }
   };
 
   // Fetch the initial server-side speech loop status on mount.
@@ -189,9 +203,114 @@ export function Thread() {
   }, []);
 
   useEffect(() => {
+    const abortController = new AbortController();
+
+    const syncSpeechThreadTarget = async () => {
+      try {
+        await fetch(`${transcriptionApiUrl}/speech/thread`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ thread_id: threadId ?? null }),
+          signal: abortController.signal,
+        });
+      } catch {
+        // no-op: backend may be unavailable while booting
+      }
+    };
+
+    void syncSpeechThreadTarget();
+
+    return () => {
+      abortController.abort();
+    };
+  }, [threadId, transcriptionApiUrl]);
+
+  useEffect(() => {
+    if (threadId !== null || !micEnabled) {
+      return;
+    }
+
+    let eventSource: EventSource | null = null;
+    let reconnectTimerId: number | null = null;
+    let disposed = false;
+
+    const connect = () => {
+      if (disposed) return;
+      eventSource = new EventSource(
+        `${transcriptionApiUrl}/speech/events`,
+      );
+
+      eventSource.addEventListener("speech_thread", ((event: MessageEvent<string>) => {
+        try {
+          const payload = JSON.parse(event.data) as { thread_id?: string };
+          const tid = typeof payload.thread_id === "string" ? payload.thread_id.trim() : "";
+          if (tid) {
+            _setThreadId(tid);
+            void refreshThreadHistory();
+          }
+        } catch {
+          // no-op
+        }
+      }) as EventListener);
+
+      eventSource.onerror = () => {
+        eventSource?.close();
+        eventSource = null;
+        if (!disposed) {
+          reconnectTimerId = window.setTimeout(connect, 1500);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+      eventSource?.close();
+      if (reconnectTimerId !== null) {
+        window.clearTimeout(reconnectTimerId);
+      }
+    };
+  }, [getThreads, micEnabled, setThreads, threadId, transcriptionApiUrl]);
+
+  useEffect(() => {
     setSyncedMessages(null);
     latestCheckpointIdRef.current = null;
+    if (threadId !== null) {
+      lastThreadActivityAtMsRef.current = Date.now();
+    }
   }, [threadId]);
+
+  useEffect(() => {
+    if (!threadId) {
+      return;
+    }
+
+    lastThreadActivityAtMsRef.current = Date.now();
+  }, [messages, threadId]);
+
+  useEffect(() => {
+    if (!threadId) {
+      return;
+    }
+
+    const timerId = window.setInterval(() => {
+      if (isLoading) {
+        return;
+      }
+
+      const idleForMs = Date.now() - lastThreadActivityAtMsRef.current;
+      if (idleForMs >= SPEECH_IDLE_NEW_THREAD_MS) {
+        setThreadId(null);
+      }
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timerId);
+    };
+  }, [isLoading, threadId]);
 
   useEffect(() => {
     if (!threadId) {
