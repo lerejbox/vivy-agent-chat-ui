@@ -15,6 +15,8 @@ import { createClient } from "./client";
 
 interface ThreadContextType {
   getThreads: () => Promise<Thread[]>;
+  deleteThread: (threadId: string) => Promise<void>;
+  deleteAllThreads: () => Promise<number>;
   threads: Thread[];
   setThreads: Dispatch<SetStateAction<Thread[]>>;
   threadsLoading: boolean;
@@ -61,8 +63,48 @@ export function ThreadProvider({ children }: { children: ReactNode }) {
     return threads;
   }, [finalApiUrl, finalAssistantId]);
 
+  const deleteThread = useCallback(
+    async (threadId: string): Promise<void> => {
+      if (!finalApiUrl || !threadId) return;
+      const client = createClient(finalApiUrl, getApiKey() ?? undefined);
+      await client.threads.delete(threadId);
+    },
+    [finalApiUrl],
+  );
+
+  const deleteAllThreads = useCallback(async (): Promise<number> => {
+    if (!finalApiUrl || !finalAssistantId) return 0;
+
+    const client = createClient(finalApiUrl, getApiKey() ?? undefined);
+    const threadIds: string[] = [];
+    const limit = 100;
+    let offset = 0;
+
+    while (true) {
+      const page = await client.threads.search({
+        metadata: {
+          ...getThreadSearchMetadata(finalAssistantId),
+        },
+        limit,
+        offset,
+      });
+
+      if (page.length === 0) break;
+
+      threadIds.push(...page.map((thread) => thread.thread_id));
+      offset += page.length;
+
+      if (page.length < limit) break;
+    }
+
+    await Promise.all(threadIds.map((threadId) => client.threads.delete(threadId)));
+    return threadIds.length;
+  }, [finalApiUrl, finalAssistantId]);
+
   const value = {
     getThreads,
+    deleteThread,
+    deleteAllThreads,
     threads,
     setThreads,
     threadsLoading,
