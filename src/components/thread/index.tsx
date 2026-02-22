@@ -6,9 +6,10 @@ import { useStreamContext } from "@/providers/Stream";
 import { useThreads } from "@/providers/Thread";
 import { useState, FormEvent, useCallback } from "react";
 import { Button } from "../ui/button";
-import { Checkpoint, Message } from "@langchain/langgraph-sdk";
+import { Message } from "@langchain/langgraph-sdk";
 import { AssistantMessage, AssistantMessageLoading } from "./messages/ai";
 import { HumanMessage } from "./messages/human";
+import { deleteMessage } from "@/lib/message-api";
 import {
   DO_NOT_RENDER_ID_PREFIX,
   ensureToolCallsHaveResponses,
@@ -155,15 +156,20 @@ export function Thread() {
   const transcriptionApiUrl =
     apiUrl || process.env.NEXT_PUBLIC_API_URL || "http://localhost:2024";
   const [syncedMessages, setSyncedMessages] = useState<Message[] | null>(null);
+  // When true, syncedMessages is authoritative even if shorter than streamMessages
+  // (e.g., after an in-place edit or delete that truncated the thread).
+  const [syncedIsAuthoritative, setSyncedIsAuthoritative] = useState(false);
   const latestCheckpointIdRef = useRef<string | null>(null);
   const lastThreadActivityAtMsRef = useRef<number>(Date.now());
 
   const messages =
     isLoading
       ? streamMessages
-      : syncedMessages && syncedMessages.length >= streamMessages.length
+      : (syncedIsAuthoritative && syncedMessages)
         ? syncedMessages
-        : streamMessages;
+        : syncedMessages && syncedMessages.length >= streamMessages.length
+          ? syncedMessages
+          : streamMessages;
 
   const lastError = useRef<string | undefined>(undefined);
 
@@ -183,6 +189,46 @@ export function Thread() {
       // no-op
     }
   };
+
+  /**
+   * Re-fetch the current thread's messages from the backend and mark
+   * syncedMessages as authoritative.  Called after in-place edits/deletes so
+   * the UI confirms the server state.
+   */
+  const refreshMessages = useCallback(async () => {
+    if (!threadId) return;
+    try {
+      const res = await fetch(
+        `${transcriptionApiUrl}/threads/${encodeURIComponent(threadId)}/state`,
+      );
+      if (!res.ok) return;
+      const data = await res.json() as {
+        checkpoint?: { checkpoint_id?: string };
+        values?: { messages?: Message[] };
+      };
+      const nextMessages = Array.isArray(data?.values?.messages)
+        ? data.values!.messages!
+        : [];
+      const nextCpId = data?.checkpoint?.checkpoint_id;
+      if (typeof nextCpId === "string" && nextCpId.length > 0) {
+        latestCheckpointIdRef.current = nextCpId;
+      }
+      setSyncedMessages(nextMessages);
+      setSyncedIsAuthoritative(true);
+    } catch {
+      // no-op
+    }
+  }, [threadId, transcriptionApiUrl]);
+
+  /**
+   * Apply an optimistic message list immediately (zero flicker), then confirm
+   * from the server in the background.
+   */
+  const handleMessagesChanged = useCallback((optimistic: Message[]) => {
+    setSyncedMessages(optimistic);
+    setSyncedIsAuthoritative(true);
+    void refreshMessages();
+  }, [refreshMessages]);
 
   // Fetch initial speech loop status.
   useEffect(() => {
@@ -318,6 +364,7 @@ export function Thread() {
 
   useEffect(() => {
     setSyncedMessages(null);
+    setSyncedIsAuthoritative(false);
     latestCheckpointIdRef.current = null;
     if (threadId !== null) {
       lastThreadActivityAtMsRef.current = Date.now();
@@ -498,6 +545,7 @@ export function Thread() {
     }
 
     setFirstTokenReceived(false);
+    setSyncedIsAuthoritative(false);
 
     const newHumanMessage: Message = {
       id: uuidv4(),
@@ -571,19 +619,55 @@ export function Thread() {
     }
   }, [isMicToggling, micEnabled, transcriptionApiUrl]);
 
-  const handleRegenerate = (
-    parentCheckpoint: Checkpoint | null | undefined,
-  ) => {
-    // Do this so the loading state is correct
-    prevMessageLength.current = prevMessageLength.current - 1;
+  const handleRegenerate = useCallback(async (message: Message) => {
+    if (!threadId || !message.id) return;
+
+    // Find the messages shown *before* this AI response so we can restore
+    // them as the optimistic view while the LLM regenerates.
+    const allMessages = (isLoading ? streamMessages : messages) as Message[];
+    const msgIndex = allMessages.findIndex((m) => m.id === message.id);
+    const messagesBefore = msgIndex >= 0 ? allMessages.slice(0, msgIndex) : allMessages;
+
+    // Truncate the backend thread from this message onwards (inclusive),
+    // then re-run the agent on the shortened history.
+    try {
+      await deleteMessage(transcriptionApiUrl, threadId, message.id, true);
+    } catch (e) {
+      console.error("Failed to truncate thread for regenerate:", e);
+      toast.error("Failed to regenerate response");
+      return;
+    }
+
+    prevMessageLength.current = Math.max(0, prevMessageLength.current - 1);
     setFirstTokenReceived(false);
+    setSyncedIsAuthoritative(false);
+
     stream.submit(undefined, {
-      checkpoint: parentCheckpoint,
       streamMode: ["values"],
       streamSubgraphs: true,
       streamResumable: true,
+      optimisticValues: () => ({ messages: messagesBefore }),
     });
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threadId, transcriptionApiUrl, isLoading, streamMessages, messages, stream]);
+
+  /**
+   * After a human message is edited (and the backend truncated), re-submit to
+   * the LLM. `messagesBefore` is the optimistic list up to & including the
+   * edited human message.
+   */
+  const handleHumanResubmit = useCallback((messagesBefore: Message[]) => {
+    prevMessageLength.current = messagesBefore.length;
+    setFirstTokenReceived(false);
+    setSyncedIsAuthoritative(false);
+    stream.submit(undefined, {
+      streamMode: ["values"],
+      streamSubgraphs: true,
+      streamResumable: true,
+      optimisticValues: () => ({ messages: messagesBefore }),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stream]);
 
   const chatStarted = !!threadId || !!messages.length;
   const hasNoAIOrToolMessages = !messages.find(
@@ -741,14 +825,23 @@ export function Thread() {
                         <HumanMessage
                           key={message.id || `${message.type}-${index}`}
                           message={message}
+                          allMessages={messages as Message[]}
                           isLoading={isLoading}
+                          apiUrl={transcriptionApiUrl}
+                          threadId={threadId}
+                          onMessagesChanged={handleMessagesChanged}
+                          onResubmit={handleHumanResubmit}
                         />
                       ) : (
                         <AssistantMessage
                           key={message.id || `${message.type}-${index}`}
                           message={message}
+                          allMessages={messages as Message[]}
                           isLoading={isLoading}
-                          handleRegenerate={handleRegenerate}
+                          handleRegenerate={() => { void handleRegenerate(message); }}
+                          apiUrl={transcriptionApiUrl}
+                          threadId={threadId}
+                          onMessagesChanged={handleMessagesChanged}
                         />
                       ),
                     )}
@@ -758,8 +851,11 @@ export function Thread() {
                     <AssistantMessage
                       key="interrupt-msg"
                       message={undefined}
+                      allMessages={messages as Message[]}
                       isLoading={isLoading}
-                      handleRegenerate={handleRegenerate}
+                      apiUrl={transcriptionApiUrl}
+                      threadId={threadId}
+                      onMessagesChanged={handleMessagesChanged}
                     />
                   )}
                   {isLoading && !firstTokenReceived && (

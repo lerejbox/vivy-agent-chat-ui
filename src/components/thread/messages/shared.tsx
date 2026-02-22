@@ -5,13 +5,50 @@ import {
   Pencil,
   Copy,
   CopyCheck,
-  ChevronLeft,
-  ChevronRight,
+  ArrowDown,
+  Trash2,
+  Check,
+  Volume2,
 } from "lucide-react";
+export { ArrowDown, Volume2 };
 import { TooltipIconButton } from "../tooltip-icon-button";
 import { AnimatePresence, motion } from "framer-motion";
 import { useState } from "react";
-import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+
+// ---------------------------------------------------------------------------
+// EditableContent – shared between HumanMessage and AssistantMessage
+// ---------------------------------------------------------------------------
+
+export function EditableContent({
+  value,
+  setValue,
+  onSubmit,
+}: {
+  value: string;
+  setValue: React.Dispatch<React.SetStateAction<string>>;
+  onSubmit: () => void;
+}) {
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      onSubmit();
+    }
+  };
+
+  return (
+    <Textarea
+      value={value}
+      onChange={(e) => setValue(e.target.value)}
+      onKeyDown={handleKeyDown}
+      className="focus-visible:ring-0"
+    />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Copy button
+// ---------------------------------------------------------------------------
 
 function ContentCopyable({
   content,
@@ -66,156 +103,197 @@ function ContentCopyable({
   );
 }
 
-export function BranchSwitcher({
-  branch,
-  branchOptions,
-  onSelect,
-  isLoading,
-}: {
-  branch: string | undefined;
-  branchOptions: string[] | undefined;
-  onSelect: (branch: string) => void;
-  isLoading: boolean;
-}) {
-  if (!branchOptions || !branch) return null;
-  const index = branchOptions.indexOf(branch);
+// ---------------------------------------------------------------------------
+// CommandBar
+// ---------------------------------------------------------------------------
 
-  return (
-    <div className="flex items-center gap-2">
-      <Button
-        variant="ghost"
-        size="icon"
-        className="size-6 p-1"
-        onClick={() => {
-          const prevBranch = branchOptions[index - 1];
-          if (!prevBranch) return;
-          onSelect(prevBranch);
-        }}
-        disabled={isLoading}
-      >
-        <ChevronLeft />
-      </Button>
-      <span className="text-sm">
-        {index + 1} / {branchOptions.length}
-      </span>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="size-6 p-1"
-        onClick={() => {
-          const nextBranch = branchOptions[index + 1];
-          if (!nextBranch) return;
-          onSelect(nextBranch);
-        }}
-        disabled={isLoading}
-      >
-        <ChevronRight />
-      </Button>
-    </div>
-  );
-}
-
+/**
+ * Action bar rendered below each message bubble (human or AI).
+ *
+ * States:
+ *  · idle        – Copy | Refresh (AI) | Edit | Delete
+ *  · editing     – Cancel | Save-edit | Save-edit+truncate
+ *  · truncateConfirm – Cancel | Confirm (while textarea still visible)
+ *  · deleteConfirm   – Cancel | Confirm
+ */
 export function CommandBar({
   content,
-  isHumanMessage,
-  isAiMessage,
   isEditing,
   setIsEditing,
   handleSubmitEdit,
+  handleSubmitEditAndTruncate,
+  editSecondaryIcon,
+  editSecondaryTooltip,
+  editSecondaryRequiresConfirm = true,
   handleRegenerate,
+  handleDelete,
   isLoading,
 }: {
   content: string;
-  isHumanMessage?: boolean;
-  isAiMessage?: boolean;
-  isEditing?: boolean;
-  setIsEditing?: React.Dispatch<React.SetStateAction<boolean>>;
-  handleSubmitEdit?: () => void;
+  isEditing: boolean;
+  /** Called with true when edit starts, false when it ends. */
+  setIsEditing: (editing: boolean) => void;
+  handleSubmitEdit: () => void;
+  handleSubmitEditAndTruncate: () => void;
+  /** Icon for the secondary edit-submit button. Defaults to ArrowDown. */
+  editSecondaryIcon?: React.ReactNode;
+  /** Tooltip for the secondary edit-submit button. */
+  editSecondaryTooltip?: string;
+  /**
+   * Whether the secondary edit-submit button requires a confirmation step.
+   * Defaults to true (safe for destructive actions like truncate).
+   * Set to false for non-destructive actions like "play audio".
+   */
+  editSecondaryRequiresConfirm?: boolean;
+  /** When set, a Refresh button is shown (AI messages only). */
   handleRegenerate?: () => void;
+  handleDelete: () => void;
   isLoading: boolean;
 }) {
-  if (isHumanMessage && isAiMessage) {
-    throw new Error(
-      "Can only set one of isHumanMessage or isAiMessage to true, not both.",
-    );
-  }
+  const [deleteConfirming, setDeleteConfirming] = useState(false);
+  const [truncateConfirming, setTruncateConfirming] = useState(false);
 
-  if (!isHumanMessage && !isAiMessage) {
-    throw new Error(
-      "One of isHumanMessage or isAiMessage must be set to true.",
-    );
-  }
+  const resolvedSecondaryIcon = editSecondaryIcon ?? <ArrowDown />;
+  const resolvedSecondaryTooltip =
+    editSecondaryTooltip ?? "Save edit and delete all subsequent messages";
 
-  if (
-    isHumanMessage &&
-    (isEditing === undefined ||
-      setIsEditing === undefined ||
-      handleSubmitEdit === undefined)
-  ) {
-    throw new Error(
-      "If isHumanMessage is true, all of isEditing, setIsEditing, and handleSubmitEdit must be set.",
-    );
-  }
+  const handleCancelEdit = () => {
+    setIsEditing(false);
+    setTruncateConfirming(false);
+  };
 
-  const showEdit =
-    isHumanMessage &&
-    isEditing !== undefined &&
-    !!setIsEditing &&
-    !!handleSubmitEdit;
+  // ------------------------------------------------------------------
+  // Editing mode
+  // ------------------------------------------------------------------
+  if (isEditing) {
+    if (truncateConfirming) {
+      // Second step: confirm "save edit AND delete subsequent"
+      return (
+        <div className="flex items-center gap-2">
+          <TooltipIconButton
+            disabled={isLoading}
+            tooltip="Cancel"
+            variant="ghost"
+            onClick={() => setTruncateConfirming(false)}
+          >
+            <XIcon />
+          </TooltipIconButton>
+          <TooltipIconButton
+            disabled={isLoading}
+            tooltip={`Confirm: ${resolvedSecondaryTooltip.toLowerCase()}`}
+            variant="secondary"
+            onClick={() => {
+              setTruncateConfirming(false);
+              handleSubmitEditAndTruncate();
+            }}
+          >
+            <Check />
+          </TooltipIconButton>
+        </div>
+      );
+    }
 
-  if (isHumanMessage && isEditing && !!setIsEditing && !!handleSubmitEdit) {
     return (
       <div className="flex items-center gap-2">
         <TooltipIconButton
           disabled={isLoading}
           tooltip="Cancel edit"
           variant="ghost"
-          onClick={() => {
-            setIsEditing(false);
-          }}
+          onClick={handleCancelEdit}
         >
           <XIcon />
         </TooltipIconButton>
         <TooltipIconButton
           disabled={isLoading}
-          tooltip="Submit"
+          tooltip="Save edit"
           variant="secondary"
           onClick={handleSubmitEdit}
         >
           <SendHorizontal />
         </TooltipIconButton>
+        <TooltipIconButton
+          disabled={isLoading}
+          tooltip={resolvedSecondaryTooltip}
+          variant="ghost"
+          onClick={() => {
+            if (editSecondaryRequiresConfirm) {
+              setTruncateConfirming(true);
+            } else {
+              handleSubmitEditAndTruncate();
+            }
+          }}
+        >
+          {resolvedSecondaryIcon}
+        </TooltipIconButton>
       </div>
     );
   }
 
+  // ------------------------------------------------------------------
+  // Delete confirmation
+  // ------------------------------------------------------------------
+  if (deleteConfirming) {
+    return (
+      <div className="flex items-center gap-2">
+        <TooltipIconButton
+          disabled={isLoading}
+          tooltip="Cancel delete"
+          variant="ghost"
+          onClick={() => setDeleteConfirming(false)}
+        >
+          <XIcon />
+        </TooltipIconButton>
+        <TooltipIconButton
+          disabled={isLoading}
+          tooltip="Confirm delete"
+          variant="ghost"
+          className="text-red-500 hover:text-red-600"
+          onClick={() => {
+            setDeleteConfirming(false);
+            handleDelete();
+          }}
+        >
+          <Check />
+        </TooltipIconButton>
+      </div>
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Idle state
+  // ------------------------------------------------------------------
   return (
     <div className="flex items-center gap-2">
       <ContentCopyable
         content={content}
         disabled={isLoading}
       />
-      {isAiMessage && !!handleRegenerate && (
+      {!!handleRegenerate && (
         <TooltipIconButton
           disabled={isLoading}
-          tooltip="Refresh"
+          tooltip="Regenerate response"
           variant="ghost"
           onClick={handleRegenerate}
         >
           <RefreshCcw />
         </TooltipIconButton>
       )}
-      {showEdit && (
-        <TooltipIconButton
-          disabled={isLoading}
-          tooltip="Edit"
-          variant="ghost"
-          onClick={() => {
-            setIsEditing?.(true);
-          }}
-        >
-          <Pencil />
-        </TooltipIconButton>
-      )}
+      <TooltipIconButton
+        disabled={isLoading}
+        tooltip="Edit"
+        variant="ghost"
+        onClick={() => setIsEditing(true)}
+      >
+        <Pencil />
+      </TooltipIconButton>
+      <TooltipIconButton
+        disabled={isLoading}
+        tooltip="Delete message"
+        variant="ghost"
+        onClick={() => setDeleteConfirming(true)}
+      >
+        <Trash2 />
+      </TooltipIconButton>
     </div>
   );
 }

@@ -1,76 +1,91 @@
-import { useStreamContext } from "@/providers/Stream";
 import { Message } from "@langchain/langgraph-sdk";
 import { useState } from "react";
 import { getContentString } from "../utils";
 import { cn } from "@/lib/utils";
-import { Textarea } from "@/components/ui/textarea";
-import { BranchSwitcher, CommandBar } from "./shared";
+import { CommandBar, EditableContent } from "./shared";
 import { MultimodalPreview } from "@/components/thread/MultimodalPreview";
 import { isBase64ContentBlock } from "@/lib/multimodal-utils";
-
-function EditableContent({
-  value,
-  setValue,
-  onSubmit,
-}: {
-  value: string;
-  setValue: React.Dispatch<React.SetStateAction<string>>;
-  onSubmit: () => void;
-}) {
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-      e.preventDefault();
-      onSubmit();
-    }
-  };
-
-  return (
-    <Textarea
-      value={value}
-      onChange={(e) => setValue(e.target.value)}
-      onKeyDown={handleKeyDown}
-      className="focus-visible:ring-0"
-    />
-  );
-}
+import { editMessage, deleteMessage } from "@/lib/message-api";
+import { toast } from "sonner";
 
 export function HumanMessage({
   message,
+  allMessages,
   isLoading,
+  apiUrl,
+  threadId,
+  onMessagesChanged,
+  onResubmit,
 }: {
   message: Message;
+  allMessages: Message[];
   isLoading: boolean;
+  apiUrl: string;
+  threadId: string | null;
+  onMessagesChanged: (optimistic: Message[]) => void;
+  onResubmit: (messagesBefore: Message[]) => void;
 }) {
-  const thread = useStreamContext();
-  const meta = thread.getMessagesMetadata(message);
-  const parentCheckpoint = meta?.firstSeenState?.parent_checkpoint;
-
   const [isEditing, setIsEditing] = useState(false);
   const [value, setValue] = useState("");
   const contentString = getContentString(message.content);
 
-  const handleSubmitEdit = () => {
+  const handleSetEditing = (editing: boolean) => {
+    if (editing) setValue(contentString);
+    setIsEditing(editing);
+  };
+
+  // Compute the truncated optimistic list: all messages up to and including
+  // this human message, with the edited content applied.
+  const buildOptimistic = (editedValue: string) => {
+    const idx = allMessages.findIndex((m) => m.id === message.id);
+    return [
+      ...allMessages.slice(0, idx),
+      { ...message, content: editedValue },
+    ] as Message[];
+  };
+
+  const handleSubmitEdit = async () => {
+    if (!threadId || !message.id) return;
     setIsEditing(false);
+    const optimistic = buildOptimistic(value);
+    onMessagesChanged(optimistic);
+    try {
+      await editMessage(apiUrl, threadId, message.id, value, true);
+      onResubmit(optimistic);
+    } catch (e) {
+      console.error("Failed to edit message:", e);
+      toast.error("Failed to save edit");
+      onMessagesChanged(allMessages); // revert
+    }
+  };
 
-    const newMessage: Message = { type: "human", content: value };
-    thread.submit(
-      { messages: [newMessage] },
-      {
-        checkpoint: parentCheckpoint,
-        streamMode: ["values"],
-        streamSubgraphs: true,
-        streamResumable: true,
-        optimisticValues: (prev) => {
-          const values = meta?.firstSeenState?.values;
-          if (!values) return prev;
+  const handleSubmitEditAndTruncate = async () => {
+    if (!threadId || !message.id) return;
+    setIsEditing(false);
+    const optimistic = buildOptimistic(value);
+    onMessagesChanged(optimistic);
+    try {
+      await editMessage(apiUrl, threadId, message.id, value, true);
+      onResubmit(optimistic);
+    } catch (e) {
+      console.error("Failed to edit message:", e);
+      toast.error("Failed to save edit");
+      onMessagesChanged(allMessages); // revert
+    }
+  };
 
-          return {
-            ...values,
-            messages: [...(values.messages ?? []), newMessage],
-          };
-        },
-      },
-    );
+  const handleDelete = async () => {
+    if (!threadId || !message.id) return;
+    // Apply optimistic update immediately — remove this message
+    const optimistic = allMessages.filter((m) => m.id !== message.id);
+    onMessagesChanged(optimistic);
+    try {
+      await deleteMessage(apiUrl, threadId, message.id, false);
+    } catch (e) {
+      console.error("Failed to delete message:", e);
+      toast.error("Failed to delete message");
+      onMessagesChanged(allMessages); // revert
+    }
   };
 
   return (
@@ -89,7 +104,7 @@ export function HumanMessage({
           />
         ) : (
           <div className="flex flex-col gap-2">
-            {/* Render images and files if no text */}
+            {/* Images / file previews */}
             {Array.isArray(message.content) && message.content.length > 0 && (
               <div className="flex flex-wrap items-end justify-end gap-2">
                 {message.content.reduce<React.ReactNode[]>(
@@ -109,7 +124,6 @@ export function HumanMessage({
                 )}
               </div>
             )}
-            {/* Render text if present, otherwise fallback to file/image name */}
             {contentString ? (
               <p className="bg-muted ml-auto w-fit rounded-3xl px-4 py-2 text-right whitespace-pre-wrap">
                 {contentString}
@@ -125,27 +139,18 @@ export function HumanMessage({
             isEditing && "opacity-100",
           )}
         >
-          <BranchSwitcher
-            branch={meta?.branch}
-            branchOptions={meta?.branchOptions}
-            onSelect={(branch) => thread.setBranch(branch)}
-            isLoading={isLoading}
-          />
           <CommandBar
             isLoading={isLoading}
             content={contentString}
             isEditing={isEditing}
-            setIsEditing={(c) => {
-              if (c) {
-                setValue(contentString);
-              }
-              setIsEditing(c);
-            }}
-            handleSubmitEdit={handleSubmitEdit}
-            isHumanMessage={true}
+            setIsEditing={handleSetEditing}
+            handleSubmitEdit={() => { void handleSubmitEdit(); }}
+            handleSubmitEditAndTruncate={() => { void handleSubmitEditAndTruncate(); }}
+            handleDelete={() => { void handleDelete(); }}
           />
         </div>
       </div>
     </div>
   );
 }
+
